@@ -18,7 +18,7 @@ oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 EMBED_MODEL = "text-embedding-3-small"
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-NEWS_API_URL = "https://newsapi.org/v2/top-headlines"
+NEWS_API_URL = "https://newsapi.org/v2/everything"
 
 def fetch_recent_news(hours: int = 1) -> List[Dict]:
     """Fetch news from NewsAPI for the last N hours"""
@@ -27,22 +27,21 @@ def fetch_recent_news(hours: int = 1) -> List[Dict]:
         return []
     
     # Format date for NewsAPI (YYYY-MM-DDTHH:MM:SSZ, no microseconds)
-    from_date = (datetime.now(UTC) - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
-    
-    params = {
-        "apiKey": NEWS_API_KEY,
-        "country": "us",  # top-headlines supports country
-        "category": "business",  # or "general", "technology", etc.
-        "pageSize": 10,
-    }
+    # from_date = (datetime.now(UTC) - timedelta(hours=hours)).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    from_date = (datetime.now(UTC) - timedelta(hours=hours)).strftime("%Y-%m-%d")
     # params = {
     #     "apiKey": NEWS_API_KEY,
-    #     "q": "world OR global OR economy OR politics OR finance OR business OR markets",
-    #     "language": "en",
-    #     "sortBy": "publishedAt",
-    #     "pageSize": 50,
-    #     "from": from_date,
+    #     "country": "us",
+    #     "category": "business",  # Options: business, general, technology, health, science, sports, entertainment
     # }
+    params = {
+        "apiKey": NEWS_API_KEY,
+        "q": "world OR global OR economy OR politics OR finance OR business OR markets OR housing OR technology OR inflation OR interest rates OR unemployment",
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 100,
+        "from": from_date,
+    }
     
     try:
         print(f"Fetching news from {from_date}...")
