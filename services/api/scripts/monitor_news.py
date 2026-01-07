@@ -211,7 +211,13 @@ def create_recommendation_for_user(
             "Only use the provided candidates; never invent markets or facts. "
             "Choose DISTINCT event_id values (no repeats) and EXACTLY ONE market per event. "
             "Choose hedge_leg YES/NO as the protective side and explain why in 1-2 sentences. "
-            "Return STRICT JSON."
+            "For each recommendation, estimate: "
+            "1) estimated_loss: The potential financial loss (in USD) the individual could face if this event happens, "
+            "based on their profile (region, industry, sensitivities, hedge_budget_monthly). "
+            "2) estimated_recovery: If they purchase contracts worth their hedge_budget_monthly (or a reasonable portion) "
+            "at the current market price (found in the candidate's outcomes.latest_price), calculate how much they'd recover "
+            "if the hedge_leg resolves. For binary markets: if price is P (0-1), spending $X buys $X/P worth of contracts, "
+            "so if it resolves YES they'd recover $X/P. Return STRICT JSON."
         )
     else:
         system = (
@@ -222,7 +228,13 @@ def create_recommendation_for_user(
             "IMPORTANT: choose DISTINCT event_id values (no repeats). "
             "For each selected event, choose EXACTLY ONE market under that event. "
             "Choose hedge_leg YES/NO and explain why in 1-2 sentences. "
-            "Return STRICT JSON."
+            "For each recommendation, estimate: "
+            "1) estimated_loss: The potential financial loss (in USD) the business could face if this event happens, "
+            "based on their profile (region, industry, sensitivities, hedge_budget_monthly). "
+            "2) estimated_recovery: If they purchase contracts worth their hedge_budget_monthly (or a reasonable portion) "
+            "at the current market price (found in the candidate's outcomes.latest_price), calculate how much they'd recover "
+            "if the hedge_leg resolves. For binary markets: if price is P (0-1), spending $X buys $X/P worth of contracts, "
+            "so if it resolves YES they'd recover $X/P. Return STRICT JSON."
         )
     
     event_series = {e["event_id"]: e.get("series_ticker") for e in affected_events}
@@ -250,7 +262,9 @@ def create_recommendation_for_user(
                 "hedge_leg": "YES|NO",
                 "why": "1-2 sentences explaining why this hedge is relevant given the news",
                 "status": "hedge_now|wait",
-                "series_ticker": "series ticker from db"
+                "series_ticker": "series ticker from db",
+                "estimated_loss": "number|null - Estimated loss in USD if event happens",
+                "estimated_recovery": "number|null - Estimated recovery in USD if hedge contracts are purchased at current price"
             }]
         }
     }

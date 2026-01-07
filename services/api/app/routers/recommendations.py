@@ -24,6 +24,8 @@ class HedgeRec(BaseModel):
     external_market_id: Optional[str] = None
     hedge_leg: str  # "YES" or "NO"
     why: str
+    estimated_loss: Optional[float] = None  # Estimated loss if event happens (USD)
+    estimated_recovery: Optional[float] = None  # Estimated recovery if hedge is purchased (USD)
 
 class RunRecommendationsRes(BaseModel):
     user_id: str
@@ -127,7 +129,13 @@ def run_recommendations(payload: RunRecommendationsReq):
             "Only use the provided candidates; never invent markets or facts. "
             "Choose DISTINCT event_id values (no repeats) and EXACTLY ONE market per event. "
             "Choose hedge_leg YES/NO as the protective side for the individual and explain why in 1-2 sentences. "
-            "Return STRICT JSON."
+            "For each recommendation, estimate: "
+            "1) estimated_loss: The potential financial loss (in USD) the individual could face if this event happens, "
+            "based on their profile (region, industry, sensitivities, hedge_budget_monthly). "
+            "2) estimated_recovery: If they purchase contracts worth their hedge_budget_monthly (or a reasonable portion) "
+            "at the current market price (found in the candidate's outcomes.latest_price), calculate how much they'd recover "
+            "if the hedge_leg resolves. For binary markets: if price is P (0-1), spending $X buys $X/P worth of contracts, "
+            "so if it resolves YES they'd recover $X/P. Return STRICT JSON."
         )
     else:
         system = (
@@ -137,7 +145,13 @@ def run_recommendations(payload: RunRecommendationsReq):
             "IMPORTANT: choose DISTINCT event_id values (no repeats). "
             "For each selected event, choose EXACTLY ONE market under that event. "
             "Choose hedge_leg YES/NO and explain why in 1-2 sentences. "
-            "Return STRICT JSON."
+            "For each recommendation, estimate: "
+            "1) estimated_loss: The potential financial loss (in USD) the business could face if this event happens, "
+            "based on their profile (region, industry, sensitivities, hedge_budget_monthly). "
+            "2) estimated_recovery: If they purchase contracts worth their hedge_budget_monthly (or a reasonable portion) "
+            "at the current market price (found in the candidate's outcomes.latest_price), calculate how much they'd recover "
+            "if the hedge_leg resolves. For binary markets: if price is P (0-1), spending $X buys $X/P worth of contracts, "
+            "so if it resolves YES they'd recover $X/P. Return STRICT JSON."
         )
 
     llm_input = {
@@ -163,6 +177,8 @@ def run_recommendations(payload: RunRecommendationsReq):
                     "hedge_leg": "YES|NO",
                     "why": "1-2 sentences",
                     "status": "hedge_now|wait",
+                    "estimated_loss": "number|null - Estimated loss in USD if event happens",
+                    "estimated_recovery": "number|null - Estimated recovery in USD if hedge contracts are purchased at current price",
                 }
             ]
         }
@@ -224,6 +240,8 @@ def run_recommendations(payload: RunRecommendationsReq):
             "status": r.get("status"),
             "rationale": r.get("why", ""),
             "rec_json": r,
+            "estimated_loss": r.get("estimated_loss"),
+            "estimated_recovery": r.get("estimated_recovery"),
         })
 
     if rows:

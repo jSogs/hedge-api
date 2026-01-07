@@ -10,21 +10,15 @@ load_dotenv()
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 SERIES = [
-    "KXEGGS",
-    "KXCPI",
-    "KXFEDDECISION",
-    "KXAAAGASM",
-    "KXNYCRENTSY",
-    "KXSEASNOWM",
+    "kxtechlayoff",
+    "kxnycchildcare",
+    "kxrainnyc",
 ]
 
 SERIES_CATEGORY = {
-    "KXEGGS": "inflation",     # grocery/food inflation proxy
-    "KXCPI": "inflation",
-    "KXFEDDECISION": "rates",
-    "KXAAAGASM": "inflation",  # gas/energy costs
-    "KXNYCRENTSY": "inflation",# cost of living / shelter
-    "KXSEASNOWM": "weather",
+    "kxtechlayoff": "layoffs",
+    "kxnycchildcare": "healthcare",
+    "kxrainnyc": "weather",
 }
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -40,7 +34,7 @@ def fetch_events_for_series(series_ticker: str):
     while True:
         params = {
             "limit": 200,
-            "series_ticker": series_ticker,
+            "series_ticker": series_ticker.upper(),
             "with_nested_markets": "true",
             "status": "open",  # ✅ you added this
         }
