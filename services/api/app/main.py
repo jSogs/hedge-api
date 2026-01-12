@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.search import router as search_router
 from app.routers import recommendations
 from app.routers import notifications
+from app.routers import chat
+from app.routers import documents
 
 app = FastAPI(title="Hedge API", version="0.1.0")
 
@@ -22,3 +24,5 @@ app.add_middleware(
 app.include_router(search_router, prefix="/v1")
 app.include_router(recommendations.router)
 app.include_router(notifications.router)
+app.include_router(chat.router)
+app.include_router(documents.router)
