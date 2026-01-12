@@ -1,13 +1,15 @@
 from fastapi import APIRouter, HTTPException
+import uuid
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
 import os
+import httpx
 
 from openai import OpenAI
 from app.db.supabase import sb
-from app.ai.embed import embed_text
 
 router = APIRouter(prefix="/v1/chat", tags=["chat"])
 oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -39,30 +41,195 @@ class ConversationDetail(BaseModel):
     messages: List[Dict[str, Any]]
 
 # Tool functions that the LLM can call
-def search_markets(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """Search for markets using semantic search"""
+def search_markets(query: str, limit: str = "auto") -> List[Dict[str, Any]]:
+    """Search for markets using Probable API - natural language search.
+    
+    Args:
+        query: Natural language search query
+        limit: Number of results (default: "auto" - let LLM decide)
+    """
     try:
-        q_emb = embed_text(query)
+        debug = os.getenv("PROBABLE_DEBUG", "").lower() in ("1", "true", "yes", "on")
+        api_key = os.getenv("PROBABLE_API_KEY")
+        api_url = os.getenv("PROBABLE_API_URL", "https://probable-api-app-d4a064dc7b26.herokuapp.com/api/search")
         
-        payload = sb.rpc("search_kalshi_events_with_markets", {
-            "query_embedding": q_emb,
-            "match_count": limit,
-            "markets_per_event": 3,
-        }).execute().data
+        if not api_key:
+            print("Warning: PROBABLE_API_KEY not set, falling back to empty results")
+            return []
         
-        payload = payload or {"results": []}
-        results = payload.get("results") or []
+        # Call Probable API
+        if debug:
+            print(f"[search_markets] Calling Probable API with query: {query}, limit: {limit}")
+        response = httpx.post(
+            api_url,
+            headers={
+                "x-api-key": api_key,
+                "Content-Type": "application/json"
+            },
+            json={
+                "query": query,
+                "limit": limit,  # Can be "auto" or a number
+                "includeClosed": False,  # Only live markets for hedging
+                "minVolume": 0
+            },
+            timeout=30.0  # Increased timeout to 30 seconds
+        )
+        if debug:
+            print(f"[search_markets] Got response: status={response.status_code}")
         
-        # Filter by minimum similarity
-        filtered_results = [
-            r for r in results
-            if isinstance(r, dict) and r.get("similarity", 0) >= 0.5
-        ]
+        if response.status_code != 200:
+            print(f"Probable API error: {response.status_code} - {response.text}")
+            return []
         
-        return filtered_results
+        data = response.json()
+        
+        # Transform Probable API response to our internal format
+        markets = data.get("markets", [])
+        
+        # Convert to our expected format
+        transformed_results = []
+        for market in markets:
+            # Group by market since Probable API returns individual markets
+            result = {
+                "event_id": market.get("id"),
+                "event_title": market.get("title"),
+                "similarity": market.get("quality_score", 0) / 10.0,  # Normalize quality_score to 0-1
+                "series_ticker": market.get("slug"),
+                "markets": [{
+                    "market_id": market.get("id"),
+                    "market_title": market.get("title"),
+                    "external_market_id": market.get("external_id"),
+                    "platform": market.get("platform"),
+                    "category": market.get("category"),
+                    "description": market.get("description"),
+                    "end_time": market.get("end_time"),
+                    "volume": market.get("volume_total"),
+                    "liquidity": market.get("liquidity"),
+                    "outcomes": [
+                        {
+                            "label": outcome,
+                            "outcome_id": f"{market.get('id')}_{outcome.lower()}",
+                            "latest_price": {
+                                "price": float(market.get("outcomeprices", [])[idx]) if idx < len(market.get("outcomeprices", [])) and market.get("outcomeprices", [])[idx] else None,
+                            } if idx < len(market.get("outcomeprices", [])) else None
+                        }
+                        for idx, outcome in enumerate(market.get("outcomes", []))
+                    ]
+                }]
+            }
+            transformed_results.append(result)
+        
+        return transformed_results
+        
+    except httpx.TimeoutException:
+        print("Probable API timeout")
+        return []
     except Exception as e:
         print(f"Error in search_markets: {e}")
+        import traceback
+        traceback.print_exc()
         return []
+
+def _should_prefetch_markets(user_message: str) -> bool:
+    """
+    Heuristic: if user is asking to fetch/search markets or hedge opportunities, we prefetch
+    markets up-front so the UI reliably shows market cards (without relying on the model to tool-call).
+    """
+    m = (user_message or "").lower()
+    keywords = [
+        "market", "markets",
+        "search", "find",
+        "fetch",
+        "opportunit",  # opportunity/opportunities
+        "hedge", "hedges", "hedging",
+        "prediction market", "prediction markets",
+        "kalshi", "polymarket",
+    ]
+    return any(k in m for k in keywords)
+
+def _build_market_query(user_message: str) -> str:
+    """
+    Turn a user instruction like "fetch gas price hedges" into a cleaner natural-language
+    query for the markets API.
+    """
+    raw = (user_message or "").strip()
+    low = raw.lower()
+
+    # A few high-signal shortcuts (works well for common cases)
+    if "gas" in low and "price" in low:
+        return "gas prices"
+    if "steel" in low:
+        return "steel prices"
+    if "aluminum" in low or "aluminium" in low:
+        return "aluminum prices"
+    if "copper" in low:
+        return "copper prices"
+    if "lumber" in low:
+        return "lumber prices"
+
+    # Strip common command-y filler words
+    stop_phrases = [
+        "fetch", "search", "find", "show", "get", "give",
+        "me", "some", "more",
+        "markets", "market",
+        "hedge", "hedges", "hedging",
+        "opportunity", "opportunities",
+        "please",
+    ]
+    cleaned = low
+    for p in stop_phrases:
+        cleaned = cleaned.replace(p, " ")
+    cleaned = " ".join(cleaned.split()).strip()
+
+    return cleaned or raw
+
+def _tokenize_for_relevance(text: str) -> List[str]:
+    text = (text or "").lower()
+    for ch in "()[]{}.,:;!?/\\\"'`":
+        text = text.replace(ch, " ")
+    parts = [p for p in text.split() if p]
+    stop = {
+        "the","a","an","and","or","to","of","in","on","for","with","by","at","from","as",
+        "will","be","is","are","was","were","it","this","that","these","those",
+        "above","below","over","under",
+        "price","prices",  # keep query meaningful; we can treat price words as low-signal
+        "market","markets","prediction","hedge","hedges","hedging",
+        "fetch","search","find","show","get","give","me","some","more","please",
+    }
+    return [p for p in parts if p not in stop and len(p) > 2]
+
+def _filter_relevant_results(query: str, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Hard filter: only keep results that mention at least one salient query token
+    in the title/description. This prevents obviously unrelated markets from showing.
+    """
+    q_tokens = set(_tokenize_for_relevance(query))
+    if not q_tokens:
+        return results
+
+    kept: List[Dict[str, Any]] = []
+    for r in results or []:
+        title = (r.get("event_title") or "") + " " + ((r.get("markets") or [{}])[0].get("market_title") or "")
+        desc = ((r.get("markets") or [{}])[0].get("description") or "")
+        hay = f"{title} {desc}".lower()
+        if any(t in hay for t in q_tokens):
+            kept.append(r)
+    return kept
+
+def _refine_query_once(query: str) -> str:
+    """
+    Basic refinement: prefer commodity-specific phrasing.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return query
+    if "steel" in q:
+        return "steel prices commodity"
+    if "copper" in q:
+        return "copper prices commodity"
+    if "aluminum" in q or "aluminium" in q:
+        return "aluminum prices commodity"
+    return query
 
 def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
     """Get user's risk profile"""
@@ -90,7 +257,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_markets",
-            "description": "Search for prediction markets related to a topic. Use this when the user asks about specific markets, events, or hedging opportunities.",
+            "description": "Search for prediction markets related to a topic. Use this when the user asks about specific markets, events, or hedging opportunities. Only returns live, open markets that users can trade.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -99,9 +266,10 @@ TOOLS = [
                         "description": "The search query (e.g., 'inflation', 'gas prices', 'interest rates')"
                     },
                     "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return",
-                        "default": 5
+                        "type": "string",
+                        "description": "Number of results to return. Use 'auto' to let the system decide based on relevance, or specify a number if the user requests a specific amount.",
+                        "default": "auto",
+                        "enum": ["auto", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
                     }
                 },
                 "required": ["query"]
@@ -127,9 +295,18 @@ TOOLS = [
     }
 ]
 
-def build_system_prompt(profile: Optional[Dict[str, Any]] = None) -> str:
+def build_system_prompt(profile: Optional[Dict[str, Any]] = None, with_thinking: bool = False) -> str:
     """Build system prompt with optional user profile context"""
-    base_prompt = """You are Hedge, an AI assistant that helps users understand and navigate prediction markets for hedging purposes.
+    
+    thinking_instructions = """
+
+IMPORTANT:
+- Do NOT reveal your private chain-of-thought / internal reasoning. Don't write “I will…” planning text.
+- Do NOT print tool call JSON or pretend-call tools in plain text.
+- If you need market data, use the provided tools via tool-calling; otherwise respond normally.
+""" if with_thinking else ""
+    
+    base_prompt = f"""You are Probable, an AI assistant that helps users understand and navigate prediction markets for hedging purposes.
 
 Your role:
 - Help users understand hedging concepts and strategies
@@ -143,7 +320,10 @@ Important guidelines:
 - Be clear, educational, and helpful
 - When discussing specific markets, explain WHY they're relevant for hedging
 - Use the search_markets function when users ask about specific topics or markets
-- Keep responses concise but informative
+- If markets have been fetched (tool results are present), you MUST base your answer on those markets:
+  - Briefly say whether the fetched markets are suitable for the user's hedging goal.
+  - If the fetched markets are not suitable (or the list is empty), ask a clarifying question AND suggest a better search angle (keywords/region/timeframe).
+- Keep responses concise but informative{thinking_instructions}
 """
     
     if profile:
@@ -205,9 +385,34 @@ def create_or_get_conversation(user_id: str, conversation_id: Optional[str] = No
     return result.data[0]["id"]
 
 def update_conversation_title(conversation_id: str, first_message: str):
-    """Auto-generate conversation title from first message"""
-    # Simple title: first 50 chars of message
-    title = first_message[:50] + ("..." if len(first_message) > 50 else "")
+    """Auto-generate contextual conversation title from first message using AI"""
+    try:
+        # Use GPT-4o-mini to generate a concise, contextual title
+        response = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a title generator. Given a user's message, create a concise 2-5 word title that captures the topic/intent. Examples: 'hi' → 'Greeting', 'how can i hedge gas price risk?' → 'Gas Price Hedging', 'what markets are available for inflation?' → 'Inflation Markets'. Keep it short and descriptive."
+                },
+                {
+                    "role": "user",
+                    "content": first_message
+                }
+            ],
+            temperature=0.3,
+            max_tokens=15
+        )
+        
+        title = response.choices[0].message.content.strip()
+        
+        # Fallback to first 50 chars if AI fails
+        if not title or len(title) > 60:
+            title = first_message[:50] + ("..." if len(first_message) > 50 else "")
+    except Exception as e:
+        print(f"Error generating title: {e}")
+        # Fallback to first 50 chars
+        title = first_message[:50] + ("..." if len(first_message) > 50 else "")
     
     sb.table("conversations").update({
         "title": title,
@@ -338,6 +543,294 @@ def send_message(payload: ChatMessage):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
+
+@router.post("/message/stream")
+async def send_message_stream(payload: ChatMessage):
+    """Send a message and stream the response with explicit thinking steps"""
+    
+    async def generate():
+        try:
+            # Get or create conversation
+            conversation_id = create_or_get_conversation(payload.user_id, payload.conversation_id)
+            
+            # Get user profile
+            profile = get_user_profile(payload.user_id)
+            
+            # Get conversation history
+            history = get_conversation_history(conversation_id, limit=10)
+            
+            # Build messages with thinking-enabled prompt
+            messages = [
+                {"role": "system", "content": build_system_prompt(profile, with_thinking=True)}
+            ]
+            messages.extend(history)
+            messages.append({"role": "user", "content": payload.message})
+            
+            # Save user message
+            sb.table("chat_messages").insert({
+                "conversation_id": conversation_id,
+                "role": "user",
+                "content": payload.message,
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            # Update conversation title if first message
+            if len(history) == 0:
+                update_conversation_title(conversation_id, payload.message)
+            
+            # Send conversation_id first
+            yield f"data: {json.dumps({'type': 'conversation_id', 'data': conversation_id})}\n\n"
+
+            # Run the model in a loop so we can handle tool calls (e.g. search_markets) and continue streaming.
+            # Without this, the stream "stops" when the model decides to call a tool.
+            full_response = ""
+            response_data: Optional[Dict[str, Any]] = None
+
+            # Always provide at least one visible "thinking" step for UX, without leaking model internals.
+            yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+            yield f"data: {json.dumps({'type': 'thinking', 'content': 'Drafting response…'})}\n\n"
+            yield f"data: {json.dumps({'type': 'thinking_end'})}\n\n"
+
+            # Prefetch markets for "market search" prompts so we always have cards to show.
+            # This also avoids cases where the model just *prints* a JSON blob instead of tool-calling.
+            if _should_prefetch_markets(payload.message):
+                prefetch_query = _build_market_query(payload.message)
+                yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+                yield f"data: {json.dumps({'type': 'thinking', 'content': f'Searching prediction markets for: {prefetch_query}'})}\n\n"
+                yield f"data: {json.dumps({'type': 'thinking_end'})}\n\n"
+
+                prefetched_raw = search_markets(query=prefetch_query, limit="auto")
+                prefetched = _filter_relevant_results(prefetch_query, prefetched_raw)
+
+                # If the search returns irrelevant results, refine once and retry.
+                if len(prefetched) == 0 and len(prefetched_raw) > 0:
+                    refined = _refine_query_once(prefetch_query)
+                    if refined != prefetch_query:
+                        yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+                        yield f"data: {json.dumps({'type': 'thinking', 'content': f'Results didn’t match well; refining search to: {refined}'})}\n\n"
+                        yield f"data: {json.dumps({'type': 'thinking_end'})}\n\n"
+                        refined_raw = search_markets(query=refined, limit="auto")
+                        prefetched = _filter_relevant_results(refined, refined_raw)
+                        prefetch_query = refined
+
+                response_data = {"query": prefetch_query, "results": prefetched}
+                yield f"data: {json.dumps({'type': 'markets', 'query': prefetch_query, 'results': prefetched})}\n\n"
+
+                # Provide the tool result to the model via tool messages so it can ground its answer.
+                # We do NOT rely on the model to call tools for this initial search.
+                # OpenAI requires tool_call_id length <= 40
+                tool_call_id = f"pf_{uuid.uuid4().hex[:30]}"
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "search_markets",
+                            "arguments": json.dumps({"query": prefetch_query, "limit": "auto"})
+                        }
+                    }]
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(prefetched),
+                })
+
+            def _normalize_tool_calls(tool_calls_delta: List[Any]) -> List[Dict[str, Any]]:
+                """
+                OpenAI tool_calls arrive chunked; we need to merge by index/id and concatenate arguments.
+                Returns list of tool_calls in Chat Completions format.
+                """
+                merged: Dict[int, Dict[str, Any]] = {}
+                for tc in tool_calls_delta:
+                    idx = getattr(tc, "index", 0) or 0
+                    if idx not in merged:
+                        merged[idx] = {
+                            "id": getattr(tc, "id", None),
+                            "type": "function",
+                            "function": {"name": None, "arguments": ""},
+                        }
+                    if getattr(tc, "id", None):
+                        merged[idx]["id"] = getattr(tc, "id", None)
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        name = getattr(fn, "name", None)
+                        args_part = getattr(fn, "arguments", None)
+                        if name:
+                            merged[idx]["function"]["name"] = name
+                        if args_part:
+                            merged[idx]["function"]["arguments"] += args_part
+
+                # Drop any incomplete tool calls (no id or no name)
+                normalized = []
+                for _, call in sorted(merged.items(), key=lambda x: x[0]):
+                    if call.get("id") and call["function"].get("name"):
+                        normalized.append(call)
+                return normalized
+
+            while True:
+                # Reset per-completion parsing state
+                current_section = None  # 'thinking' or 'output'
+                buffer = ""
+                tool_calls_delta: List[Any] = []
+
+                stream = oai.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    temperature=0.7,
+                    stream=True
+                )
+
+                for chunk in stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if not delta:
+                        continue
+
+                    # Accumulate tool calls
+                    if getattr(delta, "tool_calls", None):
+                        tool_calls_delta.extend(delta.tool_calls)
+                        continue
+
+                    # Handle content
+                    if getattr(delta, "content", None):
+                        buffer += delta.content
+                        full_response += delta.content
+
+                        # Parse for thinking/output tags
+                        while True:
+                            if current_section is None:
+                                thinking_start = buffer.find("<thinking>")
+                                output_start = buffer.find("<output>")
+
+                                if thinking_start != -1:
+                                    if thinking_start > 0:
+                                        text_before = buffer[:thinking_start]
+                                        yield f"data: {json.dumps({'type': 'output', 'content': text_before})}\n\n"
+
+                                    buffer = buffer[thinking_start + 10:]  # Remove <thinking>
+                                    current_section = 'thinking'
+                                    yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+                                elif output_start != -1:
+                                    if output_start > 0:
+                                        text_before = buffer[:output_start]
+                                        yield f"data: {json.dumps({'type': 'output', 'content': text_before})}\n\n"
+
+                                    buffer = buffer[output_start + 8:]  # Remove <output>
+                                    current_section = 'output'
+                                else:
+                                    break
+
+                            elif current_section == 'thinking':
+                                end_tag = buffer.find("</thinking>")
+                                if end_tag != -1:
+                                    thinking_content = buffer[:end_tag]
+                                    if thinking_content:
+                                        yield f"data: {json.dumps({'type': 'thinking', 'content': thinking_content})}\n\n"
+
+                                    yield f"data: {json.dumps({'type': 'thinking_end'})}\n\n"
+                                    buffer = buffer[end_tag + 11:]  # Remove </thinking>
+                                    current_section = None
+                                else:
+                                    tail_len = 10  # "</thinking>" len 11, keep 10
+                                    if len(buffer) > tail_len + 10:
+                                        flush_upto = len(buffer) - tail_len
+                                        yield f"data: {json.dumps({'type': 'thinking', 'content': buffer[:flush_upto]})}\n\n"
+                                        buffer = buffer[flush_upto:]
+                                    break
+
+                            elif current_section == 'output':
+                                end_tag = buffer.find("</output>")
+                                if end_tag != -1:
+                                    output_content = buffer[:end_tag]
+                                    if output_content:
+                                        yield f"data: {json.dumps({'type': 'output', 'content': output_content})}\n\n"
+
+                                    buffer = buffer[end_tag + 9:]  # Remove </output>
+                                    current_section = None
+                                else:
+                                    tail_len = 8  # "</output>" len 9, keep 8
+                                    if len(buffer) > tail_len + 5:
+                                        flush_upto = len(buffer) - tail_len
+                                        yield f"data: {json.dumps({'type': 'output', 'content': buffer[:flush_upto]})}\n\n"
+                                        buffer = buffer[flush_upto:]
+                                    break
+
+                # Send any remaining buffer at end of this completion
+                if buffer:
+                    content_type = 'thinking' if current_section == 'thinking' else 'output'
+                    yield f"data: {json.dumps({'type': content_type, 'content': buffer})}\n\n"
+
+                tool_calls = _normalize_tool_calls(tool_calls_delta)
+                if not tool_calls:
+                    break
+
+                # Execute tool calls, append results, then loop to let the model continue.
+                messages.append({"role": "assistant", "tool_calls": tool_calls})
+                for call in tool_calls:
+                    tool_name = call["function"]["name"]
+                    tool_args_raw = call["function"].get("arguments", "") or "{}"
+                    tool_call_id = call["id"]
+
+                    try:
+                        tool_args = json.loads(tool_args_raw) if tool_args_raw else {}
+                    except Exception:
+                        tool_args = {}
+
+                    tool_result: Any = None
+                    if tool_name == "search_markets":
+                        q = tool_args.get("query") or ""
+                        lim = tool_args.get("limit") or "auto"
+                        tool_raw = search_markets(query=q, limit=lim)
+                        tool_result = _filter_relevant_results(q, tool_raw)
+
+                        # Surface results to the UI for market cards
+                        response_data = {"query": q, "results": tool_result}
+                        yield f"data: {json.dumps({'type': 'markets', 'query': q, 'results': tool_result})}\n\n"
+
+                    elif tool_name == "get_market_details":
+                        mid = tool_args.get("market_id") or ""
+                        tool_result = get_market_details(market_id=mid)
+
+                    else:
+                        tool_result = {"error": f"Unknown tool: {tool_name}"}
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": json.dumps(tool_result),
+                    })
+
+            # Clean up the full response (remove tags for storage)
+            clean_response = full_response.replace("<thinking>", "").replace("</thinking>", "")
+            clean_response = clean_response.replace("<output>", "").replace("</output>", "").strip()
+            
+            # Save assistant response to DB
+            assistant_msg_result = sb.table("chat_messages").insert({
+                "conversation_id": conversation_id,
+                "role": "assistant",
+                "content": clean_response,
+                "response_data": response_data,
+                "created_at": datetime.utcnow().isoformat()
+            }).execute()
+            
+            # Update conversation timestamp
+            sb.table("conversations").update({
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", conversation_id).execute()
+            
+            # Send completion event
+            yield f"data: {json.dumps({'type': 'done', 'message_id': assistant_msg_result.data[0]['id']})}\n\n"
+            
+        except Exception as e:
+            print(f"Error in streaming chat: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 @router.get("/conversations/{user_id}", response_model=List[ConversationSummary])
 def get_user_conversations(user_id: str, limit: int = 20):

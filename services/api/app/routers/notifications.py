@@ -52,6 +52,11 @@ def mark_all_as_read(user_id: str):
 @router.get("/{user_id}/unread-count")
 def get_unread_count(user_id: str):
     """Get count of unread notifications for a user"""
-    result = sb.table("notifications").select("id", count="exact").eq("user_id", user_id).is_("read_at", None).execute()
-    return {"unread_count": result.count or 0}
+    try:
+        result = sb.table("notifications").select("*", count="exact").eq("user_id", user_id).is_("read_at", None).execute()
+        return {"unread_count": result.count or 0}
+    except Exception as e:
+        print(f"Error getting unread count: {e}")
+        # Return 0 if there's an error (table might not exist yet)
+        return {"unread_count": 0}
 

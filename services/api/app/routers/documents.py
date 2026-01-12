@@ -6,6 +6,7 @@ import json
 import base64
 import os
 import io
+import httpx
 
 from openai import OpenAI
 from app.db.supabase import sb
@@ -125,7 +126,7 @@ Return as JSON with this structure:
         extracted_data = json.loads(extraction_response.choices[0].message.content)
         print(f"Extracted data: {json.dumps(extracted_data, indent=2)}")
         
-        # Step 2: Analyze vulnerabilities and risks
+        # Step 2: Analyze vulnerabilities and generate prediction market queries
         analysis_response = oai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{
@@ -133,26 +134,36 @@ Return as JSON with this structure:
                 "content": f"""Based on this user's financial data:
 {json.dumps(extracted_data, indent=2)}
 
-Analyze:
-1. What economic events or trends most affect this person's finances?
-2. What are their biggest financial vulnerabilities?
-3. What categories have high volatility or risk?
-4. What should they consider hedging against?
+Analyze their spending patterns and identify what they should hedge using PREDICTION MARKETS.
 
-Consider factors like:
-- High percentage of income on variable costs (gas, food)
-- Exposure to inflation, interest rates, energy prices
-- Large fixed costs that could change (rent, insurance)
+Look at their expense categories (gas, food, travel, retail, utilities, etc.) and identify:
+1. Which expense categories are most significant or volatile?
+2. What economic events or price changes would impact these expenses?
+3. Generate 3-5 SHORT search queries (2-3 words each) to find relevant prediction markets.
+
+Examples of GOOD market search queries:
+- "gas prices" (if they spend on gas/fuel)
+- "food inflation" (if they spend heavily on groceries)
+- "airline prices" (if they travel frequently)
+- "interest rates" (if they have debt)
+- "recession 2026" (for general economic risk)
+- "oil prices" (for energy costs)
+- "housing market" (for rent/mortgage risk)
 
 Return as JSON:
 {{
-  "vulnerabilities": ["specific vulnerability 1", "specific vulnerability 2"],
+  "vulnerabilities": ["brief description of financial vulnerability 1", "vulnerability 2"],
   "high_risk_categories": {{
-    "category": {{"monthly_amount": number, "risk_level": "high/medium/low", "reason": "why"}}
+    "category_name": {{"monthly_amount": number, "risk_level": "high/medium/low", "reason": "why this is risky"}}
   }},
-  "hedge_suggestions": ["what to hedge against 1", "what to hedge against 2"],
+  "market_queries": ["search query 1", "search query 2", "search query 3"],
   "summary": "2-3 sentence summary of their financial risk profile"
-}}"""
+}}
+
+IMPORTANT: 
+- market_queries should be SHORT (2-3 words) and focused on SEARCHABLE prediction market topics
+- Base queries on ACTUAL spending categories from the bank statement
+- Focus on price/inflation risks, not generic advice"""
             }],
             response_format={"type": "json_object"}
         )
@@ -160,10 +171,48 @@ Return as JSON:
         risk_analysis = json.loads(analysis_response.choices[0].message.content)
         print(f"Risk analysis: {json.dumps(risk_analysis, indent=2)}")
         
+        # Step 3: Fetch prediction markets based on spending patterns
+        hedge_markets = []
+        market_queries = risk_analysis.get("market_queries", [])
+        
+        if market_queries:
+            probable_api_key = os.getenv("PROBABLE_API_KEY")
+            probable_api_url = os.getenv("PROBABLE_API_URL", "https://probable-api.netlify.app/api")
+            
+            if probable_api_key:
+                print(f"Fetching markets for queries: {market_queries}")
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    for query in market_queries[:5]:  # Limit to 5 queries
+                        try:
+                            print(f"  → Searching: '{query}'")
+                            response = await client.get(
+                                f"{probable_api_url}/search-markets",
+                                params={
+                                    "query": query,
+                                    "limit": "4",  # Get top 4 for each query
+                                    "includeClosed": "false"
+                                },
+                                headers={"x-api-key": probable_api_key}
+                            )
+                            if response.status_code == 200:
+                                markets_data = response.json()
+                                if markets_data.get("markets"):
+                                    # Add query context to each market
+                                    for market in markets_data["markets"][:2]:  # Take top 2 from each query
+                                        market["hedge_category"] = query  # Tag with the query for context
+                                        hedge_markets.append(market)
+                                    print(f"    ✓ Found {len(markets_data['markets'])} markets")
+                            else:
+                                print(f"    ✗ API returned {response.status_code}")
+                        except Exception as e:
+                            print(f"    ✗ Error: {e}")
+                print(f"\nTotal hedge markets found: {len(hedge_markets)}")
+        
         # Combine all analysis
         full_analysis = {
             "extracted_data": extracted_data,
             "risk_analysis": risk_analysis,
+            "hedge_markets": hedge_markets,  # Add actual markets
             "analyzed_at": datetime.now(UTC).isoformat(),
             "document_name": file.filename
         }
@@ -171,14 +220,25 @@ Return as JSON:
         # Get existing profile
         profile_result = sb.table("profiles").select("profile_json").eq(
             "user_id", user_id
-        ).single().execute()
+        ).execute()
         
-        if not profile_result.data:
+        if not profile_result.data or len(profile_result.data) == 0:
             raise HTTPException(status_code=404, detail="Profile not found")
         
-        # Update profile_json with financial analysis
-        existing_json = profile_result.data.get("profile_json") or {}
-        existing_json["financial_analysis"] = full_analysis
+        profile_data = profile_result.data[0]
+        
+        # Update profile_json with financial analysis (support multiple documents)
+        existing_json = profile_data.get("profile_json") or {}
+        
+        # Store as array to support multiple documents (max 3)
+        if "financial_analyses" not in existing_json:
+            existing_json["financial_analyses"] = []
+        
+        # Add new analysis
+        existing_json["financial_analyses"].append(full_analysis)
+        
+        # Keep only the latest 3 analyses
+        existing_json["financial_analyses"] = existing_json["financial_analyses"][-3:]
         
         # Save to profile
         sb.table("profiles").update({
@@ -195,7 +255,8 @@ Return as JSON:
                 "income": extracted_data.get("income"),
                 "expenses": extracted_data.get("expenses"),
                 "vulnerabilities": risk_analysis.get("vulnerabilities", []),
-                "hedge_suggestions": risk_analysis.get("hedge_suggestions", []),
+                "market_queries": market_queries,  # The search queries used
+                "hedge_markets": hedge_markets,  # Actual prediction markets
                 "summary": risk_analysis.get("summary", ""),
                 "analyzed_at": full_analysis["analyzed_at"]
             }
@@ -218,46 +279,71 @@ Return as JSON:
 
 @router.get("/{user_id}/financial-analysis")
 def get_financial_analysis(user_id: str):
-    """Get the stored financial analysis for a user"""
+    """Get the stored financial analysis for a user (returns all analyses, up to 3)"""
     try:
         profile = sb.table("profiles").select("profile_json").eq(
             "user_id", user_id
-        ).single().execute()
+        ).execute()
         
-        if not profile.data:
+        if not profile.data or len(profile.data) == 0:
             raise HTTPException(status_code=404, detail="Profile not found")
         
-        profile_json = profile.data.get("profile_json") or {}
-        financial_analysis = profile_json.get("financial_analysis")
+        profile_data = profile.data[0]
+        profile_json = profile_data.get("profile_json") or {}
         
-        if not financial_analysis:
+        # Support new multi-analysis format
+        financial_analyses = profile_json.get("financial_analyses", [])
+        
+        # Backward compatibility: check for old single analysis format
+        if not financial_analyses and profile_json.get("financial_analysis"):
+            financial_analyses = [profile_json.get("financial_analysis")]
+        
+        if not financial_analyses:
             return {"status": "no_analysis", "message": "No financial document has been analyzed yet"}
         
         return {
             "status": "found",
-            "analysis": financial_analysis
+            "analyses": financial_analyses,  # Return all analyses
+            "count": len(financial_analyses)
         }
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error getting financial analysis: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/{user_id}/financial-analysis")
-def delete_financial_analysis(user_id: str):
-    """Remove financial analysis from user profile"""
+def delete_financial_analysis(user_id: str, analysis_index: int = None):
+    """Remove financial analysis from user profile (optionally specify which one)"""
     try:
         # Get existing profile
         profile = sb.table("profiles").select("profile_json").eq(
             "user_id", user_id
-        ).single().execute()
+        ).execute()
         
-        if not profile.data:
+        if not profile.data or len(profile.data) == 0:
             raise HTTPException(status_code=404, detail="Profile not found")
         
+        profile_data = profile.data[0]
+        
         # Remove financial analysis
-        profile_json = profile.data.get("profile_json") or {}
-        if "financial_analysis" in profile_json:
-            del profile_json["financial_analysis"]
+        profile_json = profile_data.get("profile_json") or {}
+        
+        if analysis_index is not None:
+            # Delete specific analysis
+            if "financial_analyses" in profile_json:
+                analyses = profile_json["financial_analyses"]
+                if 0 <= analysis_index < len(analyses):
+                    analyses.pop(analysis_index)
+                    profile_json["financial_analyses"] = analyses
+        else:
+            # Delete all analyses
+            if "financial_analyses" in profile_json:
+                del profile_json["financial_analyses"]
+            if "financial_analysis" in profile_json:
+                del profile_json["financial_analysis"]
         
         # Update profile
         sb.table("profiles").update({
