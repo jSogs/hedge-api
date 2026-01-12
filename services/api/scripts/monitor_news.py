@@ -1,8 +1,9 @@
 import os
 import json
 import sys
+import time
 from datetime import datetime, timedelta, UTC
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable, Any
 from dotenv import load_dotenv
 from supabase import create_client
 from openai import OpenAI
@@ -19,6 +20,42 @@ oai = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 EMBED_MODEL = "text-embedding-3-small"
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 NEWS_API_URL = "https://newsapi.org/v2/everything"
+
+def rate_limited_call(func: Callable, max_retries: int = 3, initial_delay: float = 1.0, backoff_factor: float = 2.0) -> Any:
+    """
+    Wrapper for API calls to handle rate limiting with exponential backoff.
+    
+    Args:
+        func: The function to call (should be a lambda/callable with no args)
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+        backoff_factor: Multiplier for delay on each retry
+    
+    Returns:
+        The result of the function call
+    
+    Raises:
+        Exception: If all retries are exhausted or non-rate-limit error occurs
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check if it's a rate limit error
+            if "rate" in error_str and "limit" in error_str or "429" in error_str or "quota" in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = initial_delay * (backoff_factor ** attempt)
+                    print(f"  ⚠️  Rate limited, waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"  ❌ Rate limit exceeded after {max_retries} attempts")
+                    raise
+            else:
+                # Not a rate limit error, re-raise immediately
+                raise
+    return None
 
 def fetch_recent_news(hours: int = 1) -> List[Dict]:
     """Fetch news from NewsAPI for the last N hours"""
@@ -102,14 +139,16 @@ Respond with ONLY a JSON object: {{"importance": 0.85, "reason": "brief explanat
 """
     
     try:
-        resp = oai.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": "You are a financial news analyst. Return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ]
+        resp = rate_limited_call(
+            lambda: oai.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You are a financial news analyst. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
         )
         result = json.loads(resp.choices[0].message.content)
         return result.get("importance", 0.0)
@@ -124,7 +163,9 @@ def embed_news(news_item: Dict) -> Optional[List[float]]:
         return None
     
     try:
-        emb = oai.embeddings.create(model=EMBED_MODEL, input=text.strip())
+        emb = rate_limited_call(
+            lambda: oai.embeddings.create(model=EMBED_MODEL, input=text.strip())
+        )
         return emb.data[0].embedding
     except Exception as e:
         print(f"Error embedding news: {e}")
@@ -270,14 +311,16 @@ def create_recommendation_for_user(
     }
     
     try:
-        resp = oai.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(llm_input)},
-            ],
+        resp = rate_limited_call(
+            lambda: oai.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(llm_input)},
+                ],
+            )
         )
         
         parsed = json.loads(resp.choices[0].message.content)
@@ -444,22 +487,29 @@ def process_news_item(news_item: Dict) -> Optional[str]:
     
     # For each user, check if they're affected and create recommendations
     created_count = 0
-    for profile in profiles:
+    for idx, profile in enumerate(profiles, 1):
         user_id = profile.get("user_id")
         if not user_id:
             continue
         
         try:
+            print(f"  [{idx}/{len(profiles)}] Creating recommendations for user {user_id[:8]}...")
             rec_id = create_recommendation_for_user(
                 user_id, profile, news_event_id, affected_events, title
             )
             if rec_id:
                 created_count += 1
+                print(f"    ✓ Created recommendation")
+            
+            # Small delay between users to avoid rate limiting
+            if idx < len(profiles):
+                time.sleep(0.3)
         except Exception as e:
-            print(f"Error creating recommendation for user {user_id}: {e}")
+            print(f"    ❌ Error creating recommendation for user {user_id}: {e}")
+            time.sleep(0.5)  # Slightly longer delay after errors
             continue
     
-    print(f"Created {created_count} recommendations for {len(profiles)} users")
+    print(f"  📊 Created {created_count} recommendations for {len(profiles)} users")
     return news_event_id
 
 def main():
@@ -479,18 +529,26 @@ def main():
     skipped_duplicates = 0
     skipped_no_matches = 0
     
-    for item in news_items:
+    for idx, item in enumerate(news_items, 1):
         try:
+            print(f"\n[{idx}/{len(news_items)}] Processing article...")
             news_id = process_news_item(item)
             if news_id:
                 processed += 1
+                print(f"  ✓ Successfully processed and created recommendations")
             else:
                 # Count different skip reasons (this is approximate)
                 skipped_low_importance += 1
+            
+            # Add delay between articles to avoid rate limiting
+            # Skip delay for last item
+            if idx < len(news_items):
+                time.sleep(0.5)  # 500ms delay between articles
         except Exception as e:
             print(f"Error processing news item: {e}")
             import traceback
             traceback.print_exc()
+            time.sleep(1.0)  # Longer delay after errors
             continue
     
     print("-" * 60)

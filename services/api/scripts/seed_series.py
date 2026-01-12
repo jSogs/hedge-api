@@ -10,15 +10,108 @@ load_dotenv()
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 SERIES = [
-    "kxtechlayoff",
-    "kxnycchildcare",
-    "kxrainnyc",
+    "KXGRETAGAZA",
+"KXATTYGENNC",
+"KXINJH",
+"KXWHATSONSTAGEBPIAM",
+"KXELECTIONMOVNJGOV",
+"TOPALBUMRECORDY",
+"KXCHOPINCOMPETITION",
+"KXENDORSEMAM",
+"KXSCREWWORMCOUNT",
+"KXTRUMPGOLF",
+"KXMAYOROAKLAND",
+"KXSNAPRESTRICT",
+"KXSTUDENTVISAS",
+"KXMOLDOVAMAJORITY",
+"KXOKSTCOACH",
+"KXNBADRAFT1",
+"KXBRAZILTARIFFSIZE",
+"KXNFLEXACTWINSCAR",
+"BAFTASUPACTO",
+"KXMOVIESITP",
+"CREDEFMINMAX",
+"KXTENCOACH",
+"KXSENATECHILE",
+"INXI",
+"KXNYCCOUCNIL8",
+"KXLOSEREALMADRID",
+"KXBILLBOARDPEAKHOUDINI",
+"KXCOSTARICAPRES",
+"KXCZECHCOALITION",
+"KXRANKLISTAIWFCIS",
+"KXEOTRUMPTERM",
+"KXITAXH",
+"KXTOP10SABRINAC",
+"KXCODINGMODEL",
+"KXDOGE",
+"RENTNYCM",
+"KXMITACKMAN",
+"KXEASTCOASTPORTSTRIKE",
+"KXLANAREY",
+"KXCAPCONTROL",
+"KXSTARWARS",
+"KXNC01R",
+"KXMEXICOCITY",
+"KXDEBTGROWTH",
+"KXSPOTIFYCHARTSTREAKMANCHILD",
+"KXMAYORMIA",
+"KXHIGHNY0",
+"KXEARNINGSMENTIONDIS",
+"KXBIGBROTHER",
+"KXSTEFANIKCOUNT",
+"KXTACAPORTADVANCE",
+"KXAPPRANKFREESECOND",
+"KXNFLWINS-CLE",
 ]
 
 SERIES_CATEGORY = {
-    "kxtechlayoff": "layoffs",
-    "kxnycchildcare": "healthcare",
-    "kxrainnyc": "weather",
+  "KXGRETAGAZA": "Politics",
+"KXATTYGENNC": "Elections",
+"KXINJH": "Politics",
+"KXWHATSONSTAGEBPIAM": "Entertainment",
+"KXELECTIONMOVNJGOV": "Elections",
+"TOPALBUMRECORDY": "Entertainment",
+"KXCHOPINCOMPETITION": "Entertainment",
+"KXENDORSEMAM": "Elections",
+"KXSCREWWORMCOUNT": "Health",
+"KXTRUMPGOLF": "Sports",
+"KXMAYOROAKLAND": "Elections",
+"KXSNAPRESTRICT": "Politics",
+"KXSTUDENTVISAS": "Politics",
+"KXMOLDOVAMAJORITY": "Elections",
+"KXOKSTCOACH": "Sports",
+"KXNBADRAFT1": "Sports",
+"KXBRAZILTARIFFSIZE": "Politics",
+"KXNFLEXACTWINSCAR": "Sports",
+"BAFTASUPACTO": "Entertainment",
+"KXMOVIESITP": "Entertainment",
+"CREDEFMINMAX": "Economics",
+"KXTENCOACH": "Sports",
+"KXSENATECHILE": "Elections",
+"INXI": "Financials",
+"KXNYCCOUCNIL8": "Politics",
+"KXLOSEREALMADRID": "Sports",
+"KXBILLBOARDPEAKHOUDINI": "Entertainment",
+"KXCOSTARICAPRES": "Elections",
+"KXCZECHCOALITION": "Politics",
+"KXRANKLISTAIWFCIS": "Entertainment",
+"KXEOTRUMPTERM": "Politics",
+"KXITAXH": "Politics",
+"KXTOP10SABRINAC": "Entertainment",
+"KXCODINGMODEL": "Science and Technology",
+"KXDOGE": "Crypto",
+"RENTNYCM": "Economics",
+"KXMITACKMAN": "Politics",
+"KXEASTCOASTPORTSTRIKE": "Economics",
+"KXLANAREY": "Entertainment",
+"KXCAPCONTROL": "Elections",
+"KXSTARWARS": "Entertainment",
+"KXNC01R": "Elections",
+"KXMEXICOCITY": "Politics",
+"KXDEBTGROWTH": "Politics",
+"KXSPOTIFYCHARTSTREAKMANCHILD": "Entertainment",
+"KXMAYORMIA": "Elections",
 }
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -27,7 +120,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-def fetch_events_for_series(series_ticker: str):
+def fetch_events_for_series(series_ticker: str, max_retries: int = 5):
     events = []
     cursor = None
 
@@ -36,14 +129,43 @@ def fetch_events_for_series(series_ticker: str):
             "limit": 200,
             "series_ticker": series_ticker.upper(),
             "with_nested_markets": "true",
-            "status": "open",  # ✅ you added this
+            "status": "open",
         }
         if cursor:
             params["cursor"] = cursor
 
-        r = requests.get(f"{BASE_URL}/events", params=params, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
+        # Retry logic with exponential backoff
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(f"{BASE_URL}/events", params=params, timeout=30)
+                
+                # Handle rate limiting
+                if r.status_code == 429:
+                    retry_after = int(r.headers.get("Retry-After", 5))
+                    wait_time = min(retry_after, 2 ** attempt)  # Exponential backoff, max from header
+                    print(f"  Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
+                
+                r.raise_for_status()
+                payload = r.json()
+                break
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8, 16 seconds
+                    print(f"  Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"  Failed to fetch {series_ticker} after {attempt + 1} attempts")
+                    raise
+            except Exception as e:
+                print(f"  Error fetching {series_ticker}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
 
         batch = payload.get("events", [])
         events.extend(batch)
@@ -52,7 +174,8 @@ def fetch_events_for_series(series_ticker: str):
         if not cursor:
             break
 
-        time.sleep(0.05)
+        # Add delay between paginated requests
+        time.sleep(0.5)
 
     return events
 
@@ -255,28 +378,60 @@ def main():
     total_events = 0
     total_markets = 0
     total_outcomes = 0
+    failed_series = []
 
-    for s in SERIES:
-        evts = fetch_events_for_series(s)
-        print(f"\n=== {s} fetched {len(evts)} events ===")
-        total_events += len(evts)
+    print(f"Processing {len(SERIES)} series with rate limiting...")
+    
+    for i, s in enumerate(SERIES):
+        print(f"\n[{i+1}/{len(SERIES)}] Processing {s}...")
+        
+        try:
+            evts = fetch_events_for_series(s)
+            print(f"  Fetched {len(evts)} events")
+            
+            if not evts:
+                print(f"  No events found for {s}")
+                continue
+            
+            total_events += len(evts)
 
-        # 1) Events
-        event_id_map = upsert_events(evts, s)
+            # 1) Events
+            event_id_map = upsert_events(evts, s)
 
-        # 2) Markets
-        market_id_map = upsert_markets(evts, event_id_map)
+            # 2) Markets
+            market_id_map = upsert_markets(evts, event_id_map)
 
-        # 3) Outcomes
-        n_out = upsert_outcomes(evts, market_id_map)
+            # 3) Outcomes
+            n_out = upsert_outcomes(evts, market_id_map)
 
-        n_markets = len(market_id_map)
-        total_markets += n_markets
-        total_outcomes += n_out
+            n_markets = len(market_id_map)
+            total_markets += n_markets
+            total_outcomes += n_out
 
-        print(f"{s}: upserted events={len(event_id_map)}, markets={n_markets}, outcomes_rows={n_out}")
+            print(f"  ✓ Upserted events={len(event_id_map)}, markets={n_markets}, outcomes={n_out}")
+            
+            # Add delay between series to avoid rate limiting
+            if i < len(SERIES) - 1:  # Don't sleep after last one
+                time.sleep(1)
+                
+        except Exception as e:
+            print(f"  ✗ Failed to process {s}: {e}")
+            failed_series.append(s)
+            # Continue with next series instead of crashing
+            time.sleep(2)  # Wait longer after error
+            continue
 
-    print(f"\nDONE totals: events={total_events}, markets={total_markets}, outcomes_rows={total_outcomes}")
+    print(f"\n{'='*60}")
+    print(f"DONE totals:")
+    print(f"  Events: {total_events}")
+    print(f"  Markets: {total_markets}")
+    print(f"  Outcomes: {total_outcomes}")
+    
+    if failed_series:
+        print(f"\n⚠ Failed series ({len(failed_series)}):")
+        for s in failed_series:
+            print(f"  - {s}")
+        print("\nYou can retry these later.")
 
 
 if __name__ == "__main__":
