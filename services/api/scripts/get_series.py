@@ -14,7 +14,7 @@ all_series = data.get('series', [])
 print(f"Total series available: {len(all_series)}")
 
 # Pick 100 random series (or all if less than 100)
-num_to_pick = min(100, len(all_series))
+num_to_pick = min(200, len(all_series))
 random_series = random.sample(all_series, num_to_pick)
 
 print(f"Selected {num_to_pick} random series")

@@ -127,6 +127,27 @@ crontab -e
 #### `get_series.py`
 Utility script to extract categories from Kalshi series data.
 
+#### `process_new_events.py`
+Processes newly added events: embeds them and checks for user recommendations.
+
+**Usage:**
+```bash
+# Process events from last hour
+python3 scripts/process_new_events.py --hours 1
+
+# Process specific event IDs
+python3 scripts/process_new_events.py --event-ids uuid1 uuid2 uuid3
+```
+
+**What it does:**
+1. Embeds any events missing embeddings
+2. Searches for users whose profiles match the new events
+3. Creates recommendations and notifications for matching users
+
+**Use this after manually inserting events/markets** to automatically:
+- Generate embeddings for new events
+- Check if any users should be notified about new hedging opportunities
+
 ## API Endpoints
 
 ### Search
@@ -171,6 +192,32 @@ Utility script to extract categories from Kalshi series data.
 
 **GET** `/v1/notifications/{user_id}/unread-count`
 - Get count of unread notifications
+
+### Chat
+
+**POST** `/v1/chat/message`
+- Send a message and get AI response with optional market data
+- Request body:
+  ```json
+  {
+    "conversation_id": "uuid (optional, creates new if not provided)",
+    "message": "What should I hedge against?",
+    "user_id": "uuid"
+  }
+  ```
+- Response includes text response and optional market data
+
+**GET** `/v1/chat/conversations/{user_id}`
+- List user's conversations with message counts
+
+**GET** `/v1/chat/{conversation_id}`
+- Get full conversation history with all messages
+
+**DELETE** `/v1/chat/{conversation_id}?user_id=uuid`
+- Delete a conversation and all its messages
+
+**PATCH** `/v1/chat/{conversation_id}/title?user_id=uuid&title=New Title`
+- Update conversation title
 
 ## Database Schema
 
