@@ -173,7 +173,7 @@ def _build_market_query(user_message: str) -> str:
         "me", "some", "more",
         "markets", "market",
         "hedge", "hedges", "hedging",
-        "opportunity", "opportunities",
+        "opportunity", "opportunities",th 
         "please",
     ]
     cleaned = low
