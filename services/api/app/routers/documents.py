@@ -163,7 +163,8 @@ Return as JSON:
 IMPORTANT: 
 - market_queries should be SHORT (2-3 words) and focused on SEARCHABLE prediction market topics
 - Base queries on ACTUAL spending categories from the bank statement
-- Focus on price/inflation risks, not generic advice"""
+- Focus on price/inflation risks, not generic advice
+- Do NOT suggest traditional finance hedges (ETFs, stocks, options, futures). This product only recommends prediction markets."""
             }],
             response_format={"type": "json_object"}
         )
@@ -177,22 +178,35 @@ IMPORTANT:
         
         if market_queries:
             probable_api_key = os.getenv("PROBABLE_API_KEY")
-            probable_api_url = os.getenv("PROBABLE_API_URL", "https://probable-api.netlify.app/api")
-            
-            if probable_api_key:
+            # Use the same default as chat.py (this is the deployed Probable Search API endpoint).
+            probable_search_url = os.getenv(
+                "PROBABLE_API_URL",
+                "https://probable-api-app-d4a064dc7b26.herokuapp.com/api/search",
+            )
+
+            # Accept either ".../api/search" (preferred) or ".../api" and normalize.
+            probable_search_url = (probable_search_url or "").strip().rstrip("/")
+            if probable_search_url.endswith("/api"):
+                probable_search_url = probable_search_url + "/search"
+
+            if probable_api_key and probable_search_url:
                 print(f"Fetching markets for queries: {market_queries}")
                 async with httpx.AsyncClient(timeout=20.0) as client:
                     for query in market_queries[:5]:  # Limit to 5 queries
                         try:
                             print(f"  → Searching: '{query}'")
-                            response = await client.get(
-                                f"{probable_api_url}/search-markets",
-                                params={
+                            response = await client.post(
+                                probable_search_url,
+                                headers={
+                                    "x-api-key": probable_api_key,
+                                    "Content-Type": "application/json",
+                                },
+                                json={
                                     "query": query,
                                     "limit": "4",  # Get top 4 for each query
-                                    "includeClosed": "false"
+                                    "includeClosed": False,
+                                    "minVolume": 0,
                                 },
-                                headers={"x-api-key": probable_api_key}
                             )
                             if response.status_code == 200:
                                 markets_data = response.json()
@@ -202,6 +216,8 @@ IMPORTANT:
                                         market["hedge_category"] = query  # Tag with the query for context
                                         hedge_markets.append(market)
                                     print(f"    ✓ Found {len(markets_data['markets'])} markets")
+                                else:
+                                    print("    · No markets returned")
                             else:
                                 print(f"    ✗ API returned {response.status_code}")
                         except Exception as e:

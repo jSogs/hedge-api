@@ -173,7 +173,7 @@ def _build_market_query(user_message: str) -> str:
         "me", "some", "more",
         "markets", "market",
         "hedge", "hedges", "hedging",
-        "opportunity", "opportunities",th 
+        "opportunity", "opportunities",
         "please",
     ]
     cleaned = low
@@ -309,7 +309,7 @@ IMPORTANT:
     base_prompt = f"""You are Probable, an AI assistant that helps users understand and navigate prediction markets for hedging purposes.
 
 Your role:
-- Help users understand hedging concepts and strategies
+- Help users understand hedging concepts and strategies **using prediction markets**
 - Search for relevant prediction markets when asked
 - Explain how specific markets work and their hedging potential
 - Provide personalized recommendations based on user's risk profile
@@ -317,12 +317,14 @@ Your role:
 
 Important guidelines:
 - This is about hedging and risk management, NOT gambling or speculation
+- Stay prediction-market-centric: do NOT recommend traditional finance hedges (ETFs, stocks, options, futures, swaps), insurance products, or operational business tactics like “add fuel surcharges”. If prediction markets are unsuitable, say so and refine the market search instead.
 - Be clear, educational, and helpful
 - When discussing specific markets, explain WHY they're relevant for hedging
 - Use the search_markets function when users ask about specific topics or markets
 - If markets have been fetched (tool results are present), you MUST base your answer on those markets:
   - Briefly say whether the fetched markets are suitable for the user's hedging goal.
   - If the fetched markets are not suitable (or the list is empty), ask a clarifying question AND suggest a better search angle (keywords/region/timeframe).
+- If the user asks for a short horizon (e.g., 30 days) but only long-dated markets exist, do NOT pivot to trad-fi; instead propose prediction-market alternatives: different keywords, nearby proxy events, broader horizon, or location-specific markets.
 - Keep responses concise but informative{thinking_instructions}
 """
     
@@ -342,6 +344,36 @@ Tailor your responses to their specific risk profile and concerns.
         base_prompt += profile_context
     
     return base_prompt
+
+
+def _prediction_markets_only_guardrail(text: Optional[str]) -> str:
+    """
+    Lightweight shipping guardrail to prevent drift into traditional-finance hedging suggestions.
+    Streaming should be controlled via the system prompt; this is primarily for the non-stream endpoint.
+    """
+    if not text:
+        return text or ""
+    low = text.lower()
+    banned = [
+        "etf", "etfs",
+        "futures", "future contract",
+        "options", "option contract",
+        "swap", "swaps",
+        "stock", "stocks", "equity", "equities",
+        "commodities fund",
+        "fuel surcharge", "surcharges",
+    ]
+    if any(b in low for b in banned):
+        return (
+            "Those markets look long-dated relative to a 30‑day hedge window. "
+            "I won’t suggest traditional finance hedges here.\n\n"
+            "If you want a prediction‑market hedge, tell me:\n"
+            "- your location (US national vs state/city)\n"
+            "- your exact horizon (30d vs 90d vs year‑end)\n"
+            "- whether you care about retail gas (regular) vs crude oil vs CPI-energy\n\n"
+            "Then I’ll refine the query and fetch the most relevant prediction markets."
+        )
+    return text
 
 def get_conversation_history(conversation_id: str, limit: int = 10) -> List[Dict[str, str]]:
     """Get recent messages from a conversation"""
@@ -517,6 +549,8 @@ def send_message(payload: ChatMessage):
         response_data = {
             "markets": markets_data
         } if markets_data else None
+
+        assistant_content = _prediction_markets_only_guardrail(assistant_content)
         
         assistant_msg_result = sb.table("chat_messages").insert({
             "conversation_id": conversation_id,
